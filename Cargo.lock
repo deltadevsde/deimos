@@ -1006,11 +1006,10 @@ dependencies = [
 
 [[package]]
 name = "blockstore"
-version = "0.1.1"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5bff157a9c999bf0a39ca45e0b62076aa27135012cfbf9cc54ad1cf971876f0"
+checksum = "358358b19add120a5afc3dd1c8e9161d6d06c44dfec2ef8da58b7fe5c369c90d"
 dependencies = [
- "async-trait",
  "cid",
  "dashmap",
  "multihash",
@@ -1176,9 +1175,9 @@ dependencies = [
 
 [[package]]
 name = "celestia-proto"
-version = "0.1.1"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7d93904482a787d8caecb3a348788704fa044df6fb2402f28da5b91a2a5eabb"
+checksum = "7f22a6baf972f7277acfd5c4ff9b894df7db5b0aaecdb57b9b77b5679fff323e"
 dependencies = [
  "anyhow",
  "celestia-tendermint-proto",
@@ -1190,9 +1189,9 @@ dependencies = [
 
 [[package]]
 name = "celestia-rpc"
-version = "0.1.1"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f4c948ab3cd9562d256b752d874d573c836ec8b200bba87d1154bbf662d3a00"
+checksum = "c891b0371a6ae5a37650f1806221185cad25a1e19a11031707b6239ac720f0df"
 dependencies = [
  "async-trait",
  "celestia-types",
@@ -1252,9 +1251,9 @@ dependencies = [
 
 [[package]]
 name = "celestia-types"
-version = "0.1.1"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc3c4c6698257125b315c04236a28cf5156a866211d336ba6ac70cc5f88e24eb"
+checksum = "e20dce9a482131ec8a3c69c2cbe9b57bd838b26757952094e35397acb170b427"
 dependencies = [
  "base64 0.21.7",
  "bech32",
@@ -1266,6 +1265,7 @@ dependencies = [
  "cid",
  "const_format",
  "enum_dispatch",
+ "leopard-codec",
  "libp2p-identity",
  "multiaddr",
  "multihash",
@@ -3562,7 +3562,9 @@ checksum = "ce23b50ad8242c51a442f3ff322d56b02f08852c77e4c0b4d3fd684abc89c683"
 
 [[package]]
 name = "indexed-merkle-tree"
-version = "0.1.2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f8de874b7259ea140de989ea084acce69d6f5a816484fefcb9c4927e50449a5"
 dependencies = [
  "cargo-audit",
  "crypto-hash",
@@ -3962,6 +3964,17 @@ name = "lazy_static"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2abad23fbc42b3700f2f279844dc832adb2b2eb069b2df918f455c4e18cc646"
+
+[[package]]
+name = "leopard-codec"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee58dbc414bd23885d7da915e0457618b36d1fc950a6169ef2cb29829d1b1a1d"
+dependencies = [
+ "bytes",
+ "lazy_static",
+ "thiserror",
+]
 
 [[package]]
 name = "libc"

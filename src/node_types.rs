@@ -1,13 +1,16 @@
+use crate::consts::{CHANNEL_BUFFER_SIZE, DA_RETRY_COUNT, DA_RETRY_INTERVAL};
+use crate::error::DataAvailabilityError;
 use async_trait::async_trait;
-use bellman::groth16::Proof;
-use bls12_381::Bls12;
 use crypto_hash::{hex_digest, Algorithm};
 use ed25519_dalek::{Signer, SigningKey};
-use indexed_merkle_tree::{
-    error::MerkleTreeError, node::LeafNode, node::Node, tree::IndexedMerkleTree,
-};
+use futures::future::join_all;
+use indexed_merkle_tree::{error::MerkleTreeError, node::Node, tree::IndexedMerkleTree};
 use std::{self, io::ErrorKind, sync::Arc, time::Duration};
-use tokio::{task::spawn, time::sleep};
+use tokio::sync::{
+    mpsc::{channel, Receiver, Sender},
+    Mutex,
+};
+use tokio::{task::spawn, time::interval};
 
 use crate::{
     cfg::Config,
@@ -30,10 +33,13 @@ pub trait NodeType {
 
 pub struct Sequencer {
     pub db: Arc<dyn Database>,
-    pub da: Option<Arc<dyn DataAvailabilityLayer>>,
+    pub da: Arc<dyn DataAvailabilityLayer>,
     pub epoch_duration: u64,
     pub ws: WebServer,
     pub key: SigningKey,
+
+    epoch_buffer_tx: Arc<Sender<EpochJson>>,
+    epoch_buffer_rx: Arc<Mutex<Receiver<EpochJson>>>,
 }
 
 pub struct LightClient {
@@ -45,11 +51,9 @@ pub struct LightClient {
 impl NodeType for Sequencer {
     async fn start(self: Arc<Self>) -> std::result::Result<(), std::io::Error> {
         // start listening for new headers to update sync target
-        if let Some(da) = &self.da {
-            da.start().await.unwrap();
-        }
+        self.da.start().await.unwrap();
 
-        let derived_keys = self.db.get_derived_keys();
+        let derived_keys = self.db.get_derived_keys().await;
         match derived_keys {
             Ok(keys) => {
                 if keys.len() == 0 {
@@ -63,26 +67,9 @@ impl NodeType for Sequencer {
             }
         }
 
-        let cloned_self = self.clone();
-
-        debug!("starting main sequencer loop");
-        spawn(async move {
-            loop {
-                match self.finalize_epoch().await {
-                    Ok(_) => {
-                        info!(
-                            "sequencer_loop: finalized epoch {}",
-                            self.db.get_epoch().unwrap()
-                        );
-                    }
-                    Err(e) => error!("sequencer_loop: finalizing epoch: {}", e),
-                }
-                sleep(Duration::from_secs(self.epoch_duration)).await;
-            }
-        });
-
-        // starting the webserver
-        cloned_self.ws.start(cloned_self.clone()).await
+        self.clone().main_loop().await;
+        self.clone().da_loop().await;
+        self.clone().ws.start(self.clone()).await
     }
 }
 
@@ -98,6 +85,7 @@ impl NodeType for LightClient {
 
         let handle = spawn(async move {
             let mut current_position = 0;
+            let mut ticker = interval(Duration::from_secs(1));
             loop {
                 // target is updated when a new header is received
                 let target = self.da.get_message().await.unwrap();
@@ -145,7 +133,7 @@ impl NodeType for LightClient {
                         Err(e) => debug!("light client: getting epoch: {}", e),
                     };
                 }
-                sleep(Duration::from_secs(1)).await; // only for testing purposes
+                ticker.tick().await; // only for testing purposes
                 current_position = target; // Update the current position to the latest target
             }
         });
@@ -171,18 +159,73 @@ impl LightClient {
 impl Sequencer {
     pub fn new(
         db: Arc<dyn Database>,
-        da: Option<Arc<dyn DataAvailabilityLayer>>,
+        da: Arc<dyn DataAvailabilityLayer>,
         cfg: Config,
         key: SigningKey,
     ) -> Sequencer {
+        let (tx, rx) = channel(CHANNEL_BUFFER_SIZE);
         Sequencer {
             db,
             da,
             epoch_duration: cfg.epoch_time,
             ws: WebServer::new(cfg.webserver.unwrap()),
             key,
+            epoch_buffer_tx: Arc::new(tx),
+            epoch_buffer_rx: Arc::new(Mutex::new(rx)),
         }
     }
+
+    // main_loop is responsible for finalizing epochs every epoch length and writing them to the buffer for DA submission.
+    async fn main_loop(self: Arc<Self>) {
+        info!("starting main sequencer loop");
+        let epoch_buffer = self.epoch_buffer_tx.clone();
+        let mut ticker = interval(Duration::from_secs(self.epoch_duration));
+        spawn(async move {
+            loop {
+                ticker.tick().await;
+                match self.finalize_epoch().await {
+                    Ok(epoch) => {
+                        info!(
+                            "sequencer_loop: finalized epoch {}",
+                            self.db.get_epoch().await.unwrap()
+                        );
+                        epoch_buffer.send(epoch);
+                    }
+                    Err(e) => error!("sequencer_loop: finalizing epoch: {}", e),
+                }
+            }
+        });
+    }
+
+    // da_loop is responsible for submitting finalized epochs to the DA layer.
+    async fn da_loop(self: Arc<Self>) {
+        info!("starting da submission loop");
+        let mut ticker = interval(DA_RETRY_INTERVAL);
+        spawn(async move {
+            loop {
+                let epoch = self.get_message().await.unwrap();
+                let mut retry_counter = 0;
+                loop {
+                    if retry_counter > DA_RETRY_COUNT {
+                        // todo: graceful shutdown
+                        panic!("da_loop: too many retries, giving up");
+                    }
+                    match self.da.submit(&epoch).await {
+                        Ok(height) => {
+                            info!("da_loop: submitted epoch at height {}", height);
+                            break;
+                        }
+                        Err(e) => {
+                            error!("da_loop: submitting epoch: {}", e);
+                            retry_counter += 1;
+                            ticker.tick().await;
+                        }
+                    };
+                }
+            }
+        });
+    }
+
     /// Initializes the epoch state by setting up the input table and incrementing the epoch number.
     /// Periodically calls the `set_epoch_commitment` function to update the commitment for the current epoch.
     ///
@@ -192,40 +235,46 @@ impl Sequencer {
     /// 3. Waits for a specified duration before starting the next epoch.
     /// 4. Calls `set_epoch_commitment` to fetch and set the commitment for the current epoch.
     /// 5. Repeats steps 2-4 periodically.
-    pub async fn finalize_epoch(&self) -> Result<Proof<Bls12>, DeimosError> {
-        let epoch = match self.db.get_epoch() {
+    pub async fn finalize_epoch(&self) -> Result<EpochJson, DeimosError> {
+        let epoch = match self.db.get_epoch().await {
             Ok(epoch) => epoch + 1,
             Err(_) => 0,
         };
 
-        self.db.set_epoch(&epoch).map_err(DeimosError::Database)?;
+        self.db
+            .set_epoch(&epoch)
+            .await
+            .map_err(DeimosError::Database)?;
         self.db
             .reset_epoch_operation_counter()
+            .await
             .map_err(DeimosError::Database)?;
 
         // add the commitment for the operations ran since the last epoch
         let current_commitment = self
             .create_tree()
+            .await
             .map_err(DeimosError::MerkleTree)?
             .get_commitment()
             .map_err(DeimosError::MerkleTree)?;
 
         self.db
             .add_commitment(&epoch, &current_commitment)
+            .await
             .map_err(DeimosError::Database)?;
 
         let proofs = if epoch > 0 {
             let prev_epoch = epoch - 1;
-            self.db.get_proofs_in_epoch(&prev_epoch).unwrap()
+            self.db.get_proofs_in_epoch(&prev_epoch).await.unwrap()
         } else {
             vec![]
         };
 
         let prev_commitment = if epoch > 0 {
             let prev_epoch = epoch - 1;
-            self.db.get_commitment(&prev_epoch).unwrap()
+            self.db.get_commitment(&prev_epoch).await.unwrap()
         } else {
-            let empty_commitment = self.create_tree().map_err(DeimosError::MerkleTree)?;
+            let empty_commitment = self.create_tree().await.map_err(DeimosError::MerkleTree)?;
             empty_commitment
                 .get_commitment()
                 .map_err(DeimosError::MerkleTree)?
@@ -259,28 +308,43 @@ impl Sequencer {
             .to_string();
         let mut epoch_json_with_signature = epoch_json;
         epoch_json_with_signature.signature = Some(signature.clone());
-
-        if let Some(da) = &self.da {
-            // TODO: retries (#10)
-            da.submit(&epoch_json_with_signature).await;
-        }
-        Ok(proof)
+        Ok(epoch_json_with_signature)
     }
 
-    pub fn create_tree(&self) -> Result<IndexedMerkleTree, MerkleTreeError> {
+    async fn get_message(&self) -> std::result::Result<EpochJson, DataAvailabilityError> {
+        match self.epoch_buffer_rx.lock().await.recv().await {
+            Some(epoch) => Ok(epoch),
+            None => Err(DataAvailabilityError::ChannelReceiveError),
+        }
+    }
+
+    pub async fn create_tree(&self) -> Result<IndexedMerkleTree, MerkleTreeError> {
         // TODO: better error handling (#11)
         // Retrieve the keys from input order and sort them.
         let ordered_derived_dict_keys: Vec<String> =
-            self.db.get_derived_keys_in_order().unwrap_or(vec![]);
+            self.db.get_derived_keys_in_order().await.unwrap_or(vec![]);
         let mut sorted_keys = ordered_derived_dict_keys.clone();
         sorted_keys.sort();
 
         // Initialize the leaf nodes with the value corresponding to the given key. Set the next node to the tail for now.
-        let mut nodes: Vec<Node> = sorted_keys
+        let futures: Vec<_> = sorted_keys
             .iter()
             .map(|key| {
-                let value: String = self.db.get_derived_value(&key.to_string()).unwrap(); // we retrieved the keys from the input order, so we know they exist and can get the value
-                Node::new_leaf(true, true, key.clone(), value, Node::TAIL.to_string())
+                let key_clone = key.clone();
+                async move {
+                    let value = self.db.get_derived_value(&key.clone().to_string()).await;
+                    (key_clone, value)
+                }
+            })
+            .collect();
+
+        let results: Vec<_> = join_all(futures).await;
+
+        // we retrieved the keys from the input order, so we know they exist and can get the value
+        let mut nodes: Vec<Node> = results
+            .into_iter()
+            .map(|(key, value)| {
+                Node::new_leaf(true, true, key, value.unwrap(), Node::TAIL.to_string())
             })
             .collect();
 
@@ -357,7 +421,7 @@ impl Sequencer {
     /// * `true` if the operation was successful and the entry was updated.
     /// * `false` if the operation was unsuccessful, e.g., due to an invalid signature or other errors.
     ///
-    pub fn update_entry(&self, signature: &UpdateEntryJson) -> bool {
+    pub async fn update_entry(&self, signature: &UpdateEntryJson) -> bool {
         info!("Updating entry...");
         let signed_content = match verify_signature(signature, Some(signature.public_key.clone())) {
             Ok(content) => content,
@@ -382,7 +446,7 @@ impl Sequencer {
             value: message_obj.value,
         };
         // add a new key to an existing id  ( type for the value retrieved from the database explicitly set to string)
-        match self.db.get_hashchain(&signature.id) {
+        match self.db.get_hashchain(&signature.id).await {
             Ok(value) => {
                 // hashchain already exists
                 let mut current_chain = value.clone();
@@ -406,9 +470,11 @@ impl Sequencer {
                 current_chain.push(new_chain_entry.clone());
                 self.db
                     .update_hashchain(&incoming_entry, &current_chain)
+                    .await
                     .unwrap();
                 self.db
                     .set_derived_entry(&incoming_entry, &new_chain_entry, false)
+                    .await
                     .unwrap();
 
                 true
@@ -432,9 +498,11 @@ impl Sequencer {
                 }];
                 self.db
                     .update_hashchain(&incoming_entry, &new_chain)
+                    .await
                     .unwrap();
                 self.db
                     .set_derived_entry(&incoming_entry, new_chain.last().unwrap(), true)
+                    .await
                     .unwrap();
 
                 true
