@@ -37,15 +37,12 @@ impl WebServer {
         /* let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
         builder.set_private_key_file(env.key_path, SslFiletype::PEM).unwrap();
         builder.set_certificate_chain_file(env.cert_path).unwrap(); */
-        info!("Starting webserver on {}:{}", self.cfg.ip, self.cfg.port);
+        info!("starting webserver on {}:{}", self.cfg.ip, self.cfg.port);
         let ctx = Data::new(session.clone());
         let (ip, port) = (self.cfg.ip.clone(), self.cfg.port);
 
         HttpServer::new(move || {
             let cors = Cors::default()
-                .allowed_origin("http://localhost:3000")
-                .allowed_origin("http://localhost:3001")
-                .allowed_origin("https://visualizer.sebastianpusch.de")
                 .allow_any_origin()
                 .allow_any_method()
                 .allow_any_header();
@@ -587,7 +584,7 @@ async fn get_epochs(con: web::Data<Arc<Sequencer>>) -> impl Responder {
 #[get("/finalize-epoch")]
 async fn handle_finalize_epoch(con: web::Data<Arc<Sequencer>>) -> impl Responder {
     match con.finalize_epoch().await {
-        Ok(proof) => HttpResponse::Ok().body(json!(serialize_proof(&proof)).to_string()),
+        Ok(epoch) => HttpResponse::Ok().body(json!(epoch.proof).to_string()),
         Err(err) => HttpResponse::BadRequest().body(err.to_string()),
     }
 }

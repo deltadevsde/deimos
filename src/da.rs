@@ -1,9 +1,10 @@
+use crate::consts::CHANNEL_BUFFER_SIZE;
 use crate::error::{DataAvailabilityError, DatabaseError, DeimosError, GeneralError};
 use crate::utils::Signable;
 use crate::zk_snark::{Bls12Proof, VerifyingKey};
 use async_trait::async_trait;
 use celestia_rpc::{BlobClient, Client, HeaderClient};
-use celestia_types::blob::SubmitOptions;
+use celestia_types::blob::GasPrice;
 use celestia_types::{nmt::Namespace, Blob};
 use ed25519::Signature;
 use fs2::FileExt;
@@ -14,7 +15,10 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, Write};
 use std::str::FromStr;
 use std::{self, sync::Arc};
-use tokio::sync::mpsc;
+use tokio::sync::{
+    mpsc::{channel, Receiver, Sender},
+    Mutex,
+};
 use tokio::task::spawn;
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -74,10 +78,6 @@ impl Signable for EpochJson {
     }
 }
 
-enum Message {
-    UpdateTarget(u64),
-}
-
 #[async_trait]
 pub trait DataAvailabilityLayer: Send + Sync {
     async fn get_message(&self) -> Result<u64, DataAvailabilityError>;
@@ -90,8 +90,35 @@ pub trait DataAvailabilityLayer: Send + Sync {
 pub struct CelestiaConnection {
     pub client: celestia_rpc::Client,
     pub namespace_id: Namespace,
-    tx: Arc<mpsc::Sender<Message>>,
-    rx: Arc<tokio::sync::Mutex<mpsc::Receiver<Message>>>,
+
+    synctarget_tx: Arc<Sender<u64>>,
+    synctarget_rx: Arc<Mutex<Receiver<u64>>>,
+}
+
+/// The `NoopDataAvailabilityLayer` is a mock implementation of the `DataAvailabilityLayer` trait.
+pub struct NoopDataAvailabilityLayer {}
+
+#[async_trait]
+impl DataAvailabilityLayer for NoopDataAvailabilityLayer {
+    async fn get_message(&self) -> Result<u64, DataAvailabilityError> {
+        Ok(0)
+    }
+
+    async fn initialize_sync_target(&self) -> Result<u64, DataAvailabilityError> {
+        Ok(0)
+    }
+
+    async fn get(&self, _: u64) -> Result<Vec<EpochJson>, DataAvailabilityError> {
+        Ok(vec![])
+    }
+
+    async fn submit(&self, _: &EpochJson) -> Result<u64, DataAvailabilityError> {
+        Ok(0)
+    }
+
+    async fn start(&self) -> Result<(), DataAvailabilityError> {
+        Ok(())
+    }
 }
 
 /// The `LocalDataAvailabilityLayer` is a mock implementation of the `DataAvailabilityLayer` trait.
@@ -108,8 +135,7 @@ impl CelestiaConnection {
         auth_token: Option<&str>,
         namespace_hex: &String,
     ) -> Result<Self, DataAvailabilityError> {
-        // TODO: Should buffer size be configurable? Is 5 a reasonable default?
-        let (tx, rx) = mpsc::channel(5);
+        let (tx, rx) = channel(CHANNEL_BUFFER_SIZE);
 
         let client = Client::new(&connection_string, auth_token)
             .await
@@ -137,8 +163,8 @@ impl CelestiaConnection {
         Ok(CelestiaConnection {
             client,
             namespace_id,
-            tx: Arc::new(tx),
-            rx: Arc::new(tokio::sync::Mutex::new(rx)),
+            synctarget_tx: Arc::new(tx),
+            synctarget_rx: Arc::new(Mutex::new(rx)),
         })
     }
 }
@@ -146,8 +172,8 @@ impl CelestiaConnection {
 #[async_trait]
 impl DataAvailabilityLayer for CelestiaConnection {
     async fn get_message(&self) -> Result<u64, DataAvailabilityError> {
-        match self.rx.lock().await.recv().await {
-            Some(Message::UpdateTarget(height)) => Ok(height),
+        match self.synctarget_rx.lock().await.recv().await {
+            Some(height) => Ok(height),
             None => Err(DataAvailabilityError::ChannelReceiveError),
         }
     }
@@ -201,7 +227,7 @@ impl DataAvailabilityLayer for CelestiaConnection {
         debug!("blob: {:?}", serde_json::to_string(&blob));
         match self
             .client
-            .blob_submit(&[blob], SubmitOptions::default())
+            .blob_submit(&[blob.clone()], GasPrice::from(-1.0))
             .await
         {
             Ok(height) => {
@@ -211,7 +237,6 @@ impl DataAvailabilityLayer for CelestiaConnection {
                 );
                 Ok(height)
             }
-            // TODO implement retries (#10)
             Err(err) => Err(DataAvailabilityError::NetworkError(format!(
                 "Could not submit epoch to DA layer: {}",
                 err
@@ -229,13 +254,13 @@ impl DataAvailabilityLayer for CelestiaConnection {
                 ))
             })?;
 
-        let tx1 = self.tx.clone();
+        let synctarget_buffer = self.synctarget_tx.clone();
         spawn(async move {
             while let Some(extended_header_result) = header_sub.next().await {
                 match extended_header_result {
                     Ok(extended_header) => {
                         let height = extended_header.header.height.value();
-                        match tx1.send(Message::UpdateTarget(height)).await {
+                        match synctarget_buffer.send(height).await {
                             Ok(_) => {
                                 debug!("Sent message to channel. Height: {}", height);
                             }
@@ -465,7 +490,7 @@ mod da_tests {
 
         // simulate sequencer start
         let sequencer = tokio::spawn(async {
-            let sequencer_layer = LocalDataAvailabilityLayer::new();
+            let mut sequencer_layer = LocalDataAvailabilityLayer::new();
             // write all 60 seconds proofs and commitments
             // create a new tree
             let mut tree = build_empty_tree();

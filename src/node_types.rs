@@ -1,13 +1,15 @@
+use crate::consts::{CHANNEL_BUFFER_SIZE, DA_RETRY_COUNT, DA_RETRY_INTERVAL};
+use crate::error::DataAvailabilityError;
 use async_trait::async_trait;
-use bellman::groth16::Proof;
-use bls12_381::Bls12;
 use crypto_hash::{hex_digest, Algorithm};
 use ed25519_dalek::{Signer, SigningKey};
-use indexed_merkle_tree::{
-    error::MerkleTreeError, node::LeafNode, node::Node, tree::IndexedMerkleTree,
-};
+use indexed_merkle_tree::{error::MerkleTreeError, node::Node, tree::IndexedMerkleTree};
 use std::{self, io::ErrorKind, sync::Arc, time::Duration};
-use tokio::{task::spawn, time::sleep};
+use tokio::sync::{
+    mpsc::{channel, Receiver, Sender},
+    Mutex,
+};
+use tokio::{task::spawn, time::interval, time::sleep};
 
 use crate::{
     cfg::Config,
@@ -30,10 +32,13 @@ pub trait NodeType {
 
 pub struct Sequencer {
     pub db: Arc<dyn Database>,
-    pub da: Option<Arc<dyn DataAvailabilityLayer>>,
+    pub da: Arc<dyn DataAvailabilityLayer>,
     pub epoch_duration: u64,
     pub ws: WebServer,
     pub key: SigningKey,
+
+    epoch_buffer_tx: Arc<Sender<EpochJson>>,
+    epoch_buffer_rx: Arc<Mutex<Receiver<EpochJson>>>,
 }
 
 pub struct LightClient {
@@ -45,9 +50,7 @@ pub struct LightClient {
 impl NodeType for Sequencer {
     async fn start(self: Arc<Self>) -> std::result::Result<(), std::io::Error> {
         // start listening for new headers to update sync target
-        if let Some(da) = &self.da {
-            da.start().await.unwrap();
-        }
+        self.da.start().await.unwrap();
 
         let derived_keys = self.db.get_derived_keys();
         match derived_keys {
@@ -63,26 +66,9 @@ impl NodeType for Sequencer {
             }
         }
 
-        let cloned_self = self.clone();
-
-        debug!("starting main sequencer loop");
-        spawn(async move {
-            loop {
-                match self.finalize_epoch().await {
-                    Ok(_) => {
-                        info!(
-                            "sequencer_loop: finalized epoch {}",
-                            self.db.get_epoch().unwrap()
-                        );
-                    }
-                    Err(e) => error!("sequencer_loop: finalizing epoch: {}", e),
-                }
-                sleep(Duration::from_secs(self.epoch_duration)).await;
-            }
-        });
-
-        // starting the webserver
-        cloned_self.ws.start(cloned_self.clone()).await
+        self.clone().main_loop().await;
+        self.clone().da_loop().await;
+        self.clone().ws.start(self.clone()).await
     }
 }
 
@@ -98,6 +84,7 @@ impl NodeType for LightClient {
 
         let handle = spawn(async move {
             let mut current_position = 0;
+            let mut ticker = interval(Duration::from_secs(1));
             loop {
                 // target is updated when a new header is received
                 let target = self.da.get_message().await.unwrap();
@@ -145,7 +132,7 @@ impl NodeType for LightClient {
                         Err(e) => debug!("light client: getting epoch: {}", e),
                     };
                 }
-                sleep(Duration::from_secs(1)).await; // only for testing purposes
+                ticker.tick().await; // only for testing purposes
                 current_position = target; // Update the current position to the latest target
             }
         });
@@ -171,18 +158,73 @@ impl LightClient {
 impl Sequencer {
     pub fn new(
         db: Arc<dyn Database>,
-        da: Option<Arc<dyn DataAvailabilityLayer>>,
+        da: Arc<dyn DataAvailabilityLayer>,
         cfg: Config,
         key: SigningKey,
     ) -> Sequencer {
+        let (tx, rx) = channel(CHANNEL_BUFFER_SIZE);
         Sequencer {
             db,
             da,
             epoch_duration: cfg.epoch_time,
             ws: WebServer::new(cfg.webserver.unwrap()),
             key,
+            epoch_buffer_tx: Arc::new(tx),
+            epoch_buffer_rx: Arc::new(Mutex::new(rx)),
         }
     }
+
+    // main_loop is responsible for finalizing epochs every epoch length and writing them to the buffer for DA submission.
+    async fn main_loop(self: Arc<Self>) {
+        info!("starting main sequencer loop");
+        let epoch_buffer = self.epoch_buffer_tx.clone();
+        let mut ticker = interval(Duration::from_secs(self.epoch_duration));
+        spawn(async move {
+            loop {
+                ticker.tick().await;
+                match self.finalize_epoch().await {
+                    Ok(epoch) => {
+                        info!(
+                            "sequencer_loop: finalized epoch {}",
+                            self.db.get_epoch().unwrap()
+                        );
+                        epoch_buffer.send(epoch);
+                    }
+                    Err(e) => error!("sequencer_loop: finalizing epoch: {}", e),
+                }
+            }
+        });
+    }
+
+    // da_loop is responsible for submitting finalized epochs to the DA layer.
+    async fn da_loop(self: Arc<Self>) {
+        info!("starting da submission loop");
+        let mut ticker = interval(DA_RETRY_INTERVAL);
+        spawn(async move {
+            loop {
+                let epoch = self.get_message().await.unwrap();
+                let mut retry_counter = 0;
+                loop {
+                    if retry_counter > DA_RETRY_COUNT {
+                        // todo: graceful shutdown
+                        panic!("da_loop: too many retries, giving up");
+                    }
+                    match self.da.submit(&epoch).await {
+                        Ok(height) => {
+                            info!("da_loop: submitted epoch at height {}", height);
+                            break;
+                        }
+                        Err(e) => {
+                            error!("da_loop: submitting epoch: {}", e);
+                            retry_counter += 1;
+                            ticker.tick().await;
+                        }
+                    };
+                }
+            }
+        });
+    }
+
     /// Initializes the epoch state by setting up the input table and incrementing the epoch number.
     /// Periodically calls the `set_epoch_commitment` function to update the commitment for the current epoch.
     ///
@@ -192,7 +234,7 @@ impl Sequencer {
     /// 3. Waits for a specified duration before starting the next epoch.
     /// 4. Calls `set_epoch_commitment` to fetch and set the commitment for the current epoch.
     /// 5. Repeats steps 2-4 periodically.
-    pub async fn finalize_epoch(&self) -> Result<Proof<Bls12>, DeimosError> {
+    pub async fn finalize_epoch(&self) -> Result<EpochJson, DeimosError> {
         let epoch = match self.db.get_epoch() {
             Ok(epoch) => epoch + 1,
             Err(_) => 0,
@@ -259,12 +301,14 @@ impl Sequencer {
             .to_string();
         let mut epoch_json_with_signature = epoch_json;
         epoch_json_with_signature.signature = Some(signature.clone());
+        Ok(epoch_json_with_signature)
+    }
 
-        if let Some(da) = &self.da {
-            // TODO: retries (#10)
-            da.submit(&epoch_json_with_signature).await;
+    async fn get_message(&self) -> std::result::Result<EpochJson, DataAvailabilityError> {
+        match self.epoch_buffer_rx.lock().await.recv().await {
+            Some(epoch) => Ok(epoch),
+            None => Err(DataAvailabilityError::ChannelReceiveError),
         }
-        Ok(proof)
     }
 
     pub fn create_tree(&self) -> Result<IndexedMerkleTree, MerkleTreeError> {
